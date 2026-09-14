@@ -3,6 +3,8 @@ torch_compile: false
 torch_compile_mode: default
 da3_model: depth-anything/DA3NESTED-GIANT-LARGE
 conf_thresh_percentile: 25 # per frame, drop depth pixels at or below this confidence percentile
+save_per_frame_local_pointclouds: true # recon/<name>/pts_local*/
+save_graph_debug_artifacts: true # graph submaps/, matches/ and frame images, needed to resume from this run (prev_slam_folder)
 
 use_slam: false
 is_mono: false
