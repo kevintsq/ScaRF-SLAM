@@ -1787,7 +1787,8 @@ class ScaRFSLAM():
         # --- load model ---
         if self.model_name == "da":
             from depth_anything_3.api import DepthAnything3
-            self.model = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE").to(device=self.device)
+            da3_id = self.config.get("da3_model", "depth-anything/DA3NESTED-GIANT-LARGE")
+            self.model = DepthAnything3.from_pretrained(da3_id).to(device=self.device)
             if self.config.get("torch_compile", False):
                 # Compile only when requested; warmup batches are slower.
                 compile_mode = self.config.get("torch_compile_mode", "default")
@@ -1951,7 +1952,9 @@ class ScaRFSLAM():
             inference_duration = self._add_elapsed_time("model_inference_time", inference_start_time)
 
             self._update_max_distance_for_batch(ref_ts_sub)
-            predictions = self._filter_prediction_confidence(predictions, conf_thresh_percentile=25)
+            predictions = self._filter_prediction_confidence(
+                predictions, conf_thresh_percentile=float(self.config.get("conf_thresh_percentile", 25))
+            )
 
             if (
                 not self.is_mono
