@@ -185,9 +185,9 @@ class ScaRFSLAM():
         prefix = "\t" * indent
         line = f"{prefix}{label}: {duration:.6f} seconds"
         if color is not None:
-            print(f"{color}{line}\033[0m")
+            print(f"{color}{line}\033[0m", flush=True)
         else:
-            print(line)
+            print(line, flush=True)
 
 
     def _add_elapsed_time(self, attr_name: str, start_time: float) -> float:
@@ -1856,12 +1856,14 @@ class ScaRFSLAM():
                 updated_traj = False
                 if self.config.get("use_slam"):
                     updated_traj = self._refresh_slam_trajectory_for_batch([self.ref_timestamps[-1]])
+                final_step_start = time.perf_counter()
                 if self.submap_scale_opt and not updated_traj:
                     self._run_submap_scale_optimization(
                         latest_n_submaps=None,
                         max_points_per_overlap_frame=100,
                         log_prefix="loop-closure global",
                     )
+                    self._print_timing_line("Final Submap Scale Optimization Time", time.perf_counter() - final_step_start)
                 sec_str, nsec_str = self.ref_timestamps[-1].split("_", 1)
                 header_timestamp = MappingTimestamp(int(sec_str), int(nsec_str))
                 self._publish_sampled_global_pointcloud(header_timestamp=header_timestamp)
@@ -1887,20 +1889,29 @@ class ScaRFSLAM():
                 self.save_out_poses_dict_to_csv(str(recon_dir / f"poses_{self.model_name}.csv"))
                 self.save_out_poses_ts_to_csv(str(recon_dir / f"poses_{self.model_name}_ts.csv"))
                 self.save_out_poses_dict_to_tum(str(recon_dir / f"poses_{self.model_name}.txt"))
+                final_step_start = time.perf_counter()
                 pts_global, colors_global = self._compose_global_pointcloud()
+                self._print_timing_line("Final Global Point Cloud Compose Time", time.perf_counter() - final_step_start)
+                final_step_start = time.perf_counter()
                 self.save_global_pointcloud(pts_global, colors_global, suffix=suffix)
-                self.save_per_frame_local_pointclouds(
-                    Path(self.slam_folder)
-                    / "recon"
-                    / self.recon_save_folder_name
-                    / f"pts_local{suffix}"
-                )
+                self._print_timing_line("Final Global Point Cloud Save Time", time.perf_counter() - final_step_start)
+                if self.config.get("save_per_frame_local_pointclouds", True):
+                    final_step_start = time.perf_counter()
+                    self.save_per_frame_local_pointclouds(
+                        Path(self.slam_folder)
+                        / "recon"
+                        / self.recon_save_folder_name
+                        / f"pts_local{suffix}"
+                    )
+                    self._print_timing_line("Final Per-Frame Point Cloud Save Time", time.perf_counter() - final_step_start)
+                final_step_start = time.perf_counter()
                 self.save_graph(
                     Path(self.slam_folder)
                     / "recon"
                     / self.recon_save_folder_name
                     / f"opt_graph{suffix}"
                 )
+                self._print_timing_line("Final Graph Save Time", time.perf_counter() - final_step_start)
                 break
             
             ref_ts_sub = [self.ref_timestamps[j] for j in indices]
@@ -2372,7 +2383,7 @@ class ScaRFSLAM():
             poses_file.flush()
 
 
-    def _save_graph_frame_inputs(self, frames_dir: Path) -> Dict[str, Dict[str, object]]:
+    def _save_graph_frame_inputs(self, frames_dir: Path, save_images: bool = True) -> Dict[str, Dict[str, object]]:
         frames_dir.mkdir(parents=True, exist_ok=True)
         graph = self.covisibility_graph
         frame_keys = sorted(
@@ -2386,7 +2397,7 @@ class ScaRFSLAM():
             frame_dir = frames_dir / frame_key
             frame_info: Dict[str, object] = {}
 
-            image = graph._frame_image_dict.get(frame_key)
+            image = graph._frame_image_dict.get(frame_key) if save_images else None
             if image is not None:
                 image = np.asarray(image, dtype=np.uint8)
                 graph_io.save_graph_array(frame_dir / "image.npy", image)
@@ -2547,9 +2558,17 @@ class ScaRFSLAM():
         tmp_output_dir.mkdir(parents=True, exist_ok=True)
 
         graph = self.covisibility_graph
-        submap_manifest = self._save_graph_submaps(tmp_output_dir / "submaps")
-        frame_manifest = self._save_graph_frame_inputs(tmp_output_dir / "frames")
-        match_manifest = self._save_graph_matches(tmp_output_dir / "matches")
+        # Submaps, pairwise matches and frame images are what a later session needs to continue from this graph
+        # (prev_slam_folder). save_graph_debug_artifacts=False skips them and keeps the manifest, poses and the
+        # per-frame intrinsics/confidence.
+        save_debug = bool(self.config.get("save_graph_debug_artifacts", True))
+        submap_manifest = self._save_graph_submaps(tmp_output_dir / "submaps") if save_debug else {}
+        frame_manifest = self._save_graph_frame_inputs(tmp_output_dir / "frames", save_images=save_debug)
+        match_manifest = (
+            self._save_graph_matches(tmp_output_dir / "matches")
+            if save_debug
+            else {"frame_pair_matches": {}, "covisible_frame_pairs_by_submap": {}}
+        )
 
         manifest = {
             "schema_version": 1,
@@ -2641,18 +2660,28 @@ class ScaRFSLAM():
         mask = conf != 0.0
 
         if np.any(mask):
-            pcd_global = o3d.geometry.PointCloud()
-            pcd_global.points = o3d.utility.Vector3dVector(
-                pts_global[mask, :3].astype(np.float64)
-            )
-            pcd_global.colors = o3d.utility.Vector3dVector(
-                colors_global[mask].astype(np.float32) / 255.0
-            )
             recon_dir = Path(self.slam_folder) / "recon" / self.recon_save_folder_name
             recon_dir.mkdir(parents=True, exist_ok=True)
-            o3d.io.write_point_cloud(
-                str(recon_dir / f"pts_global{suffix}.pcd"), pcd_global, compressed=True
-            )
+            out_path = str(recon_dir / f"pts_global{suffix}.pcd")
+            # The PCD stores float32 positions and colors, so build a tensor point cloud from float32 arrays directly:
+            # the legacy Vector3dVector path first converts to float64 with an element-wise copy (tens of seconds for
+            # ~1e8 points). The written file is byte-identical.
+            pcd_global = o3d.t.geometry.PointCloud()
+            pcd_global.point.positions = o3d.core.Tensor(np.ascontiguousarray(pts_global[mask, :3], dtype=np.float32))
+            pcd_global.point.colors = o3d.core.Tensor(colors_global[mask].astype(np.float32) / np.float32(255.0))
+            if not o3d.t.io.write_point_cloud(out_path, pcd_global, compressed=True):
+                # Open3D's LZF-compressed PCD writer fails beyond ~2 GB of point data (int32 buffer): voxel-downsample
+                # progressively until the compressed write fits, else write uncompressed.
+                n0 = int(np.count_nonzero(mask))
+                pcd_legacy = pcd_global.to_legacy()
+                for vox in (0.02, 0.03, 0.04, 0.05, 0.08):
+                    pcd_legacy = pcd_legacy.voxel_down_sample(vox)
+                    if o3d.io.write_point_cloud(out_path, pcd_legacy, compressed=True):
+                        print(f"compressed PCD write failed for {n0} points; wrote voxel-downsampled ({vox} m, {len(pcd_legacy.points)} points) compressed")
+                        break
+                else:
+                    print(f"compressed PCD write failed for {n0} points even after downsampling; writing uncompressed")
+                    o3d.io.write_point_cloud(out_path, pcd_legacy, compressed=False)
 
 
     def save_per_frame_local_pointclouds(self, output_dir: Union[str, Path]) -> None:
