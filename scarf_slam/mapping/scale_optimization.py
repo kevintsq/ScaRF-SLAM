@@ -490,6 +490,119 @@ def optimize_frame_scales_gtsam(
     return np.asarray(scales, dtype=np.float32)
 
 
+def _optimize_component_scales_numpy(
+    num_vars: int,
+    var_i: np.ndarray,
+    var_j: np.ndarray,
+    base_diff: np.ndarray,
+    dir_i: np.ndarray,
+    dir_j: np.ndarray,
+    anchor_var: int,
+    anchor_val: float,
+    anchor_sigma: float,
+    reg_sigma: Optional[float],
+    robust_delta: float,
+    use_exp_param: bool,
+    iters: int,
+) -> np.ndarray:
+    """Vectorized equivalent of the per-component gtsam graph in optimize_submap_scales_gtsam.
+
+    Point residuals r = base_diff + g(v_i) * dir_i - g(v_j) * dir_j, with g = exp (use_exp_param) or identity and dir_*
+    already multiplied by the current scales, under a Huber(robust_delta) loss on |r| (unit isotropic noise); a Gaussian
+    anchor prior and optional Gaussian regularization priors on v. Optimized with gtsam's Levenberg-Marquardt schedule
+    (default LevenbergMarquardtParams: lambda 1e-5 x/÷ 10 up to 1e5, min model fidelity 1e-3, relative and absolute
+    error tolerance 1e-5, iterative reweighting of the robust loss at each linearization), so the result matches the
+    gtsam solve to its convergence tolerance without one Python callback per point per iteration."""
+    k = float(robust_delta)
+    reg_w = 0.0 if reg_sigma is None else 1.0 / reg_sigma**2
+    anchor_w = 1.0 / anchor_sigma**2
+
+    def point_terms(v):
+        gi = np.exp(v[var_i]) if use_exp_param else v[var_i]
+        gj = np.exp(v[var_j]) if use_exp_param else v[var_j]
+        ji = gi[:, None] * dir_i                       # d r / d v_i
+        jj = -(gj[:, None] * dir_j)                    # d r / d v_j
+        if not use_exp_param:
+            ji, jj = dir_i, -dir_j
+        r = base_diff + gi[:, None] * dir_i - gj[:, None] * dir_j
+        return r, ji, jj
+
+    def error(v):
+        r, _, _ = point_terms(v)
+        d = np.linalg.norm(r, axis=1)
+        loss = np.where(d <= k, 0.5 * d * d, k * d - 0.5 * k * k).sum()
+        loss += 0.5 * anchor_w * (v[anchor_var] - anchor_val) ** 2
+        if reg_w > 0.0:
+            loss += 0.5 * reg_w * np.sum((v - anchor_val) ** 2)
+        return float(loss)
+
+    def linearize(v):
+        r, ji, jj = point_terms(v)
+        d = np.linalg.norm(r, axis=1)
+        sw = np.sqrt(np.where(d <= k, 1.0, k / np.maximum(d, 1e-300)))[:, None]
+        ai, aj, b = ji * sw, jj * sw, -r * sw
+        h = np.zeros((num_vars, num_vars))
+        h[np.diag_indices(num_vars)] += np.bincount(var_i, (ai * ai).sum(1), num_vars) + np.bincount(var_j, (aj * aj).sum(1), num_vars)
+        cross = (ai * aj).sum(1)
+        np.add.at(h, (var_i, var_j), cross)
+        np.add.at(h, (var_j, var_i), cross)
+        g = np.bincount(var_i, (ai * b).sum(1), num_vars) + np.bincount(var_j, (aj * b).sum(1), num_vars)
+        bb = float((b * b).sum())
+        h[anchor_var, anchor_var] += anchor_w
+        g[anchor_var] += anchor_w * (anchor_val - v[anchor_var])
+        bb += anchor_w * (v[anchor_var] - anchor_val) ** 2
+        if reg_w > 0.0:
+            h[np.diag_indices(num_vars)] += reg_w
+            g += reg_w * (anchor_val - v)
+            bb += reg_w * float(np.sum((v - anchor_val) ** 2))
+        return h, g, 0.5 * bb
+
+    v = np.full(num_vars, anchor_val, dtype=np.float64)
+    current_error = error(v)
+    lam, lam_factor, lam_max, min_fidelity, rel_tol, abs_tol = 1e-5, 10.0, 1e5, 1e-3, 1e-5, 1e-5
+    iterations = 0
+    while True:
+        h, g, old_lin_error = linearize(v)
+        while True:  # gtsam LevenbergMarquardtOptimizer::tryLambda
+            step_ok, stop_search, new_v, new_error = False, False, v, current_error
+            try:
+                delta = np.linalg.solve(h + lam * np.eye(num_vars), g)
+                solved = bool(np.all(np.isfinite(delta)))
+            except np.linalg.LinAlgError:
+                solved = False
+            if solved:
+                lin_change = float(g @ delta - 0.5 * delta @ h @ delta)   # old - new linearized error
+                if lin_change >= 0.0:
+                    new_v = v + delta
+                    new_error = error(new_v)
+                    cost_change = current_error - new_error
+                    if lin_change > np.finfo(float).eps * old_lin_error:
+                        step_ok = cost_change / lin_change > min_fidelity
+                    else:
+                        step_ok = True
+                    if abs(cost_change) < rel_tol * current_error:
+                        stop_search = True
+            if step_ok:
+                lam /= lam_factor
+                v, prev_error, current_error = new_v, current_error, new_error
+                iterations += 1
+                break
+            if not stop_search:
+                lam *= lam_factor
+                if lam >= lam_max:
+                    prev_error = current_error
+                    break
+                continue
+            prev_error = current_error
+            break
+        if iterations >= max(1, int(iters)):
+            break
+        decrease = prev_error - current_error
+        if current_error <= 0.0 or decrease <= abs_tol or decrease / prev_error <= rel_tol:
+            break
+    return v
+
+
 def optimize_submap_scales_gtsam(
     submaps: Dict[str, Any],
     out_ph_poses_dict: Dict[str, Any],
@@ -505,9 +618,14 @@ def optimize_submap_scales_gtsam(
     latest_n_submaps: Optional[int] = None,
     covisible_frame_pairs: Optional[Dict[Tuple[str, str], List[Tuple[str, str]]]] = None,
     frame_pair_match_dict: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+    solver: str = "gtsam",
 ) -> Dict[str, float]:
+    """solver: "gtsam" (one CustomFactor per matched point pair) or "numpy" (_optimize_component_scales_numpy: the same
+    objective and LM schedule, vectorized; much faster on long sequences)."""
     start_total_time = time.perf_counter()
-    if gtsam is None:
+    if solver not in ("gtsam", "numpy"):
+        raise ValueError(f"solver must be 'gtsam' or 'numpy', got {solver!r}.")
+    if solver == "gtsam" and gtsam is None:
         raise ImportError("gtsam is required for optimize_submap_scales_gtsam. Please install python-gtsam.")
     if overlap_frames <= 0:
         raise ValueError("overlap_frames must be positive.")
@@ -853,82 +971,116 @@ def optimize_submap_scales_gtsam(
             component_summaries.append(f"{component_key}:singleton->scale={current_scales[comp_indices[0]]:.6f}")
             continue
 
-        graph = gtsam.NonlinearFactorGraph()
         anchor_idx = comp_indices[len(comp_indices) // 2]
         anchor_sigma = 0.03
-        anchor_key = _make_variable_key(use_exp_param, anchor_idx)
-        graph.add(gtsam.PriorFactorDouble(anchor_key, anchor_val, gtsam.noiseModel.Isotropic.Sigma(1, anchor_sigma)))
+        if solver == "numpy":
+            local = {idx: n for n, idx in enumerate(comp_indices)}
+            var_i, var_j, base_diff, dir_i, dir_j = [], [], [], [], []
+            for m in comp_obs:
+                i = int(m["i"])
+                j = int(m["j"])
+                p_i = np.asarray(m["p_i"], dtype=np.float64)
+                p_j = np.asarray(m["p_j"], dtype=np.float64)
+                base_i = rotations[i] @ centers_local[i] + translations[i]
+                base_j = rotations[j] @ centers_local[j] + translations[j]
+                var_i.append(np.full(p_i.shape[0], local[i]))
+                var_j.append(np.full(p_j.shape[0], local[j]))
+                base_diff.append(np.broadcast_to(base_i - base_j, p_i.shape))
+                dir_i.append(current_scales[i] * ((p_i - centers_local[i]) @ rotations[i].T))
+                dir_j.append(current_scales[j] * ((p_j - centers_local[j]) @ rotations[j].T))
+            v_opt = _optimize_component_scales_numpy(
+                num_vars=len(comp_indices),
+                var_i=np.concatenate(var_i),
+                var_j=np.concatenate(var_j),
+                base_diff=np.concatenate(base_diff),
+                dir_i=np.concatenate(dir_i),
+                dir_j=np.concatenate(dir_j),
+                anchor_var=local[anchor_idx],
+                anchor_val=anchor_val,
+                anchor_sigma=anchor_sigma,
+                reg_sigma=(1.0 / math.sqrt(reg_weight)) if reg_weight > 0.0 else None,
+                robust_delta=robust_delta,
+                use_exp_param=use_exp_param,
+                iters=iters,
+            )
+            solved_values = {idx: float(v_opt[local[idx]]) for idx in comp_indices}
+            num_factors = 1 + (len(comp_indices) if reg_weight > 0.0 else 0) + sum(len(x) for x in var_i)
+        else:
+            graph = gtsam.NonlinearFactorGraph()
+            anchor_key = _make_variable_key(use_exp_param, anchor_idx)
+            graph.add(gtsam.PriorFactorDouble(anchor_key, anchor_val, gtsam.noiseModel.Isotropic.Sigma(1, anchor_sigma)))
 
-        if reg_weight > 0.0:
-            sigma_reg = 1.0 / math.sqrt(reg_weight)
-            reg_noise = gtsam.noiseModel.Isotropic.Sigma(1, sigma_reg)
+            if reg_weight > 0.0:
+                sigma_reg = 1.0 / math.sqrt(reg_weight)
+                reg_noise = gtsam.noiseModel.Isotropic.Sigma(1, sigma_reg)
+                for idx in comp_indices:
+                    key = _make_variable_key(use_exp_param, idx)
+                    graph.add(gtsam.PriorFactorDouble(key, anchor_val, reg_noise))
+
+            for m in comp_obs:
+                i = int(m["i"])
+                j = int(m["j"])
+                key_i = _make_variable_key(use_exp_param, i)
+                key_j = _make_variable_key(use_exp_param, j)
+                p_i = np.asarray(m["p_i"], dtype=np.float64)
+                p_j = np.asarray(m["p_j"], dtype=np.float64)
+                c_i_local = centers_local[i]
+                c_j_local = centers_local[j]
+                base_i = rotations[i] @ c_i_local + translations[i]
+                base_j = rotations[j] @ c_j_local + translations[j]
+
+                for k in range(p_i.shape[0]):
+                    di_world = rotations[i] @ (p_i[k] - c_i_local)
+                    dj_world = rotations[j] @ (p_j[k] - c_j_local)
+                    current_scale_i = current_scales[i]
+                    current_scale_j = current_scales[j]
+
+                    def error_func(
+                        this,
+                        values,
+                        jacobians,
+                        key_i=key_i,
+                        key_j=key_j,
+                        base_i=base_i,
+                        base_j=base_j,
+                        di_world=di_world,
+                        dj_world=dj_world,
+                        current_scale_i=current_scale_i,
+                        current_scale_j=current_scale_j,
+                    ):
+                        v_i = values.atDouble(key_i)
+                        v_j = values.atDouble(key_j)
+                        delta_i = _value_to_scale(v_i, use_exp_param)
+                        delta_j = _value_to_scale(v_j, use_exp_param)
+                        s_i = current_scale_i * delta_i
+                        s_j = current_scale_j * delta_j
+                        err = (base_i + s_i * di_world - (base_j + s_j * dj_world)).astype(np.float64)
+
+                        if jacobians is not None:
+                            ddelta_i_dvi = delta_i if use_exp_param else 1.0
+                            ddelta_j_dvj = delta_j if use_exp_param else 1.0
+                            jacobians[0] = (di_world * current_scale_i * ddelta_i_dvi).reshape(3, 1).astype(np.float64)
+                            jacobians[1] = (-dj_world * current_scale_j * ddelta_j_dvj).reshape(3, 1).astype(np.float64)
+                        return err
+
+                    graph.add(gtsam.CustomFactor(robust, _make_key_vector(key_i, key_j), error_func))
+
+            initial = gtsam.Values()
+            init_value = 0.0 if use_exp_param else 1.0
             for idx in comp_indices:
-                key = _make_variable_key(use_exp_param, idx)
-                graph.add(gtsam.PriorFactorDouble(key, anchor_val, reg_noise))
+                initial.insert(_make_variable_key(use_exp_param, idx), init_value)
 
-        for m in comp_obs:
-            i = int(m["i"])
-            j = int(m["j"])
-            key_i = _make_variable_key(use_exp_param, i)
-            key_j = _make_variable_key(use_exp_param, j)
-            p_i = np.asarray(m["p_i"], dtype=np.float64)
-            p_j = np.asarray(m["p_j"], dtype=np.float64)
-            c_i_local = centers_local[i]
-            c_j_local = centers_local[j]
-            base_i = rotations[i] @ c_i_local + translations[i]
-            base_j = rotations[j] @ c_j_local + translations[j]
-
-            for k in range(p_i.shape[0]):
-                di_world = rotations[i] @ (p_i[k] - c_i_local)
-                dj_world = rotations[j] @ (p_j[k] - c_j_local)
-                current_scale_i = current_scales[i]
-                current_scale_j = current_scales[j]
-
-                def error_func(
-                    this,
-                    values,
-                    jacobians,
-                    key_i=key_i,
-                    key_j=key_j,
-                    base_i=base_i,
-                    base_j=base_j,
-                    di_world=di_world,
-                    dj_world=dj_world,
-                    current_scale_i=current_scale_i,
-                    current_scale_j=current_scale_j,
-                ):
-                    v_i = values.atDouble(key_i)
-                    v_j = values.atDouble(key_j)
-                    delta_i = _value_to_scale(v_i, use_exp_param)
-                    delta_j = _value_to_scale(v_j, use_exp_param)
-                    s_i = current_scale_i * delta_i
-                    s_j = current_scale_j * delta_j
-                    err = (base_i + s_i * di_world - (base_j + s_j * dj_world)).astype(np.float64)
-
-                    if jacobians is not None:
-                        ddelta_i_dvi = delta_i if use_exp_param else 1.0
-                        ddelta_j_dvj = delta_j if use_exp_param else 1.0
-                        jacobians[0] = (di_world * current_scale_i * ddelta_i_dvi).reshape(3, 1).astype(np.float64)
-                        jacobians[1] = (-dj_world * current_scale_j * ddelta_j_dvj).reshape(3, 1).astype(np.float64)
-                    return err
-
-                graph.add(gtsam.CustomFactor(robust, _make_key_vector(key_i, key_j), error_func))
-
-        initial = gtsam.Values()
-        init_value = 0.0 if use_exp_param else 1.0
-        for idx in comp_indices:
-            initial.insert(_make_variable_key(use_exp_param, idx), init_value)
-
-        params = gtsam.LevenbergMarquardtParams()
-        params.setMaxIterations(max(1, int(iters)))
-        params.setVerbosity("SILENT")
-        optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial, params)
-        result = optimizer.optimize()
+            params = gtsam.LevenbergMarquardtParams()
+            params.setMaxIterations(max(1, int(iters)))
+            params.setVerbosity("SILENT")
+            optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial, params)
+            result = optimizer.optimize()
+            solved_values = {idx: float(result.atDouble(_make_variable_key(use_exp_param, idx))) for idx in comp_indices}
+            num_factors = graph.size()
 
         comp_abs_scales = []
         for idx in comp_indices:
-            key = _make_variable_key(use_exp_param, idx)
-            delta_value = _value_to_scale(float(result.atDouble(key)), use_exp_param)
+            delta_value = _value_to_scale(solved_values[idx], use_exp_param)
             abs_scale = current_scales[idx] * delta_value
             deltas[idx] = delta_value
             comp_abs_scales.append(abs_scale)
@@ -943,7 +1095,7 @@ def optimize_submap_scales_gtsam(
         anchor_submap_key = selected_submap_keys[anchor_idx]
         component_summaries.append(
             f"{component_key_range}:nodes={len(comp_indices)}, pair_links={len(comp_obs)}, "
-            f"anchor={anchor_submap_key}, anchor_sigma={anchor_sigma:.6g}, factors={graph.size()}"
+            f"anchor={anchor_submap_key}, anchor_sigma={anchor_sigma:.6g}, factors={num_factors}, solver={solver}"
         )
     end_optimize_time = time.perf_counter()
 

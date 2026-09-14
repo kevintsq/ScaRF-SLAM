@@ -1417,6 +1417,7 @@ class ScaRFSLAM():
             latest_n_submaps=latest_n_submaps,
             covisible_frame_pairs=covisible_frame_pairs,
             frame_pair_match_dict=frame_pair_match_dict,
+            solver=str(self.config.get("submap_scale_solver", "gtsam")),
         )
         for submap_key, scale_value in submap_scales_dict.items():
             if submap_key not in self.submaps:
