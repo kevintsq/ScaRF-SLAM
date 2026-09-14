@@ -2013,7 +2013,11 @@ class ScaRFSLAM():
             self._publish_processed_images(predictions.processed_images, header_timestamp=header_timestamp)
 
             del predictions
-            gc.collect()
+            # A full gc pass walks every live Python object (~0.15 s per batch, ~50 s over a 330-submap sequence) and
+            # frees nothing here in practice: predictions holds no reference cycles, so `del` already releases it.
+            # Keep an occasional pass as a safety net.
+            if counter % 20 == 0:
+                gc.collect()
             torch.cuda.empty_cache()
 
             counter += int(timing_info.get("num_created_submaps", 1))
