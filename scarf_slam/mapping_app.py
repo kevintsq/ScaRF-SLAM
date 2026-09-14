@@ -52,6 +52,7 @@ from scarf_slam.core.camera import (
 from scarf_slam.utils.pointcloud_ops import (
     depth_to_world_points_vectorized,
     submap_to_world_pointcloud,
+    voxel_downsample_mean,
     world_points_to_anchor_local,
 )
 from scarf_slam.mapping import graph_io
@@ -2657,6 +2658,9 @@ class ScaRFSLAM():
         return output_dir
 
 
+    # Open3D's LZF-compressed PCD writer keeps the payload size in an int32; x y z rgb take 16 bytes per point.
+    _COMPRESSED_PCD_MAX_POINTS = (2**31 - 1) // 16
+
     def save_global_pointcloud(self, pts_global, colors_global, suffix=""):
         o3d = _require_open3d()
         conf = pts_global[:, 3]
@@ -2666,25 +2670,31 @@ class ScaRFSLAM():
             recon_dir = Path(self.slam_folder) / "recon" / self.recon_save_folder_name
             recon_dir.mkdir(parents=True, exist_ok=True)
             out_path = str(recon_dir / f"pts_global{suffix}.pcd")
+            xyz = np.ascontiguousarray(pts_global[mask, :3], dtype=np.float32)
+            rgb = colors_global[mask].astype(np.float32) / np.float32(255.0)
+            num_points = len(xyz)
+            if num_points > self._COMPRESSED_PCD_MAX_POINTS:
+                # Too large for a compressed PCD: keep the mean point of each voxel, at the finest voxel size that fits
+                # (each size is applied to the full cloud).
+                for voxel_size in (0.02, 0.03, 0.04, 0.05, 0.08):
+                    xyz_down, rgb_down = voxel_downsample_mean(xyz, rgb, voxel_size)
+                    if len(xyz_down) <= self._COMPRESSED_PCD_MAX_POINTS:
+                        print(
+                            f"global point cloud of {num_points} points exceeds the compressed-PCD size limit; "
+                            f"writing it voxel-downsampled ({voxel_size} m, {len(xyz_down)} points)",
+                            flush=True,
+                        )
+                        xyz, rgb = xyz_down, rgb_down
+                        break
             # The PCD stores float32 positions and colors, so build a tensor point cloud from float32 arrays directly:
             # the legacy Vector3dVector path first converts to float64 with an element-wise copy (tens of seconds for
             # ~1e8 points). The written file is byte-identical.
             pcd_global = o3d.t.geometry.PointCloud()
-            pcd_global.point.positions = o3d.core.Tensor(np.ascontiguousarray(pts_global[mask, :3], dtype=np.float32))
-            pcd_global.point.colors = o3d.core.Tensor(colors_global[mask].astype(np.float32) / np.float32(255.0))
+            pcd_global.point.positions = o3d.core.Tensor(xyz)
+            pcd_global.point.colors = o3d.core.Tensor(np.ascontiguousarray(rgb))
             if not o3d.t.io.write_point_cloud(out_path, pcd_global, compressed=True):
-                # Open3D's LZF-compressed PCD writer fails beyond ~2 GB of point data (int32 buffer): voxel-downsample
-                # progressively until the compressed write fits, else write uncompressed.
-                n0 = int(np.count_nonzero(mask))
-                pcd_legacy = pcd_global.to_legacy()
-                for vox in (0.02, 0.03, 0.04, 0.05, 0.08):
-                    pcd_legacy = pcd_legacy.voxel_down_sample(vox)
-                    if o3d.io.write_point_cloud(out_path, pcd_legacy, compressed=True):
-                        print(f"compressed PCD write failed for {n0} points; wrote voxel-downsampled ({vox} m, {len(pcd_legacy.points)} points) compressed")
-                        break
-                else:
-                    print(f"compressed PCD write failed for {n0} points even after downsampling; writing uncompressed")
-                    o3d.io.write_point_cloud(out_path, pcd_legacy, compressed=False)
+                print(f"compressed PCD write failed for {len(xyz)} points; writing uncompressed", flush=True)
+                o3d.t.io.write_point_cloud(out_path, pcd_global, compressed=False)
 
 
     def save_per_frame_local_pointclouds(self, output_dir: Union[str, Path]) -> None:
