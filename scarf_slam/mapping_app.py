@@ -54,6 +54,7 @@ from scarf_slam.utils.pointcloud_ops import (
     submap_to_world_pointcloud,
     voxel_downsample_mean,
     world_points_to_anchor_local,
+    write_ply_xyzrgb,
 )
 from scarf_slam.mapping import graph_io
 from scarf_slam.utils.timestamp_ops import (
@@ -2667,14 +2668,29 @@ class ScaRFSLAM():
     # Open3D's LZF-compressed PCD writer keeps the payload size in an int32; x y z rgb take 16 bytes per point.
     _COMPRESSED_PCD_MAX_POINTS = (2**31 - 1) // 16
 
+    def _pointcloud_format(self) -> str:
+        """pointcloud_format: "ply" (default; binary PLY, one numpy write, no size limit) or "pcd" (LZF-compressed PCD)."""
+        fmt = str(self.config.get("pointcloud_format", "ply")).lower()
+        if fmt not in ("ply", "pcd"):
+            raise ValueError(f"pointcloud_format must be 'ply' or 'pcd', got {fmt!r}.")
+        return fmt
+
     def save_global_pointcloud(self, pts_global, colors_global, suffix=""):
-        o3d = _require_open3d()
         conf = pts_global[:, 3]
         mask = conf != 0.0
 
         if np.any(mask):
             recon_dir = Path(self.slam_folder) / "recon" / self.recon_save_folder_name
             recon_dir.mkdir(parents=True, exist_ok=True)
+            if self._pointcloud_format() == "ply":
+                # The whole cloud, at full resolution: binary PLY has no size limit and LZF gains ~nothing on float positions.
+                write_ply_xyzrgb(
+                    str(recon_dir / f"pts_global{suffix}.ply"),
+                    np.ascontiguousarray(pts_global[mask, :3], dtype=np.float32),
+                    colors_global[mask],
+                )
+                return
+            o3d = _require_open3d()
             out_path = str(recon_dir / f"pts_global{suffix}.pcd")
             xyz = np.ascontiguousarray(pts_global[mask, :3], dtype=np.float32)
             rgb = colors_global[mask].astype(np.float32) / np.float32(255.0)
@@ -2754,11 +2770,14 @@ class ScaRFSLAM():
                 if not np.any(finite_mask):
                     continue
 
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(pts_local[finite_mask])
-                pcd.colors = o3d.utility.Vector3dVector(colors[finite_mask])
-                pcd_path = output_dir / f"cloud_{frame_key}.pcd"
-                o3d.io.write_point_cloud(str(pcd_path), pcd, compressed=True)
+                if self._pointcloud_format() == "ply":
+                    write_ply_xyzrgb(str(output_dir / f"cloud_{frame_key}.ply"), pts_local[finite_mask], colors[finite_mask])
+                else:
+                    pcd = o3d.geometry.PointCloud()
+                    pcd.points = o3d.utility.Vector3dVector(pts_local[finite_mask])
+                    pcd.colors = o3d.utility.Vector3dVector(colors[finite_mask])
+                    pcd_path = output_dir / f"cloud_{frame_key}.pcd"
+                    o3d.io.write_point_cloud(str(pcd_path), pcd, compressed=True)
                 poses_tum_dict[frame_key] = pose
 
         self.save_out_poses_dict_to_tum(str(output_dir / f"poses_{self.model_name}.txt"), poses_tum_dict)
@@ -2808,13 +2827,15 @@ class ScaRFSLAM():
             if not np.any(finite_mask):
                 continue
 
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pts_local[finite_mask])
-            pcd.colors = o3d.utility.Vector3dVector(colors[finite_mask])
-
             sec_str, nsec_str = last_frame_key.split("_")
-            pcd_path = output_dir / f"cloud_{int(sec_str)}_{int(nsec_str)}.pcd"
-            o3d.io.write_point_cloud(str(pcd_path), pcd, compressed=True)
+            if self._pointcloud_format() == "ply":
+                write_ply_xyzrgb(str(output_dir / f"cloud_{int(sec_str)}_{int(nsec_str)}.ply"), pts_local[finite_mask], colors[finite_mask])
+            else:
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(pts_local[finite_mask])
+                pcd.colors = o3d.utility.Vector3dVector(colors[finite_mask])
+                pcd_path = output_dir / f"cloud_{int(sec_str)}_{int(nsec_str)}.pcd"
+                o3d.io.write_point_cloud(str(pcd_path), pcd, compressed=True)
             poses_tum_dict[last_frame_key] = pose
 
         self.save_out_poses_dict_to_tum(str(output_dir / f"poses_{self.model_name}.txt"), poses_tum_dict)

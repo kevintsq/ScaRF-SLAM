@@ -156,6 +156,27 @@ def _voxel_downsample_mean(xyz: np.ndarray, rgb: np.ndarray, voxel_size: float, 
     return out_xyz.cpu().numpy(), out_rgb.cpu().numpy()
 
 
+def write_ply_xyzrgb(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
+    """Binary little-endian PLY (float32 x y z, uint8 red green blue) written in one numpy write: no size limit, 15 bytes per
+    point. rgb is uint8 0-255, or float in [0, 1]."""
+    xyz = np.asarray(xyz)
+    rgb = np.asarray(rgb)
+    if rgb.dtype != np.uint8:
+        rgb = np.clip(np.rint(rgb.astype(np.float32) * 255.0), 0, 255).astype(np.uint8)
+    rec = np.empty(len(xyz), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+    rec["x"], rec["y"], rec["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+    rec["red"], rec["green"], rec["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        f"element vertex {len(xyz)}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"
+    )
+    with open(path, "wb") as handle:
+        handle.write(header.encode("ascii"))
+        rec.tofile(handle)
+
+
 def voxel_downsample_mean(xyz: np.ndarray, rgb: np.ndarray, voxel_size: float) -> Tuple[np.ndarray, np.ndarray]:
     """Mean position and colour of the points in each occupied voxel (voxel index = floor(p / voxel_size)).
     Runs on the GPU when one is available (~1 s for 1.8e8 points), otherwise, or if the GPU runs out of
