@@ -2064,6 +2064,7 @@ class ScaRFSLAM():
                 reg_weight=0.05,
                 normalize_mean=False,
                 use_exp_param=True,
+                solver=str(self.config.get("frame_scale_solver", "gtsam")),
             )
             frame_scale_opt_duration = self._add_elapsed_time(
                 "frame_scale_opt_time",

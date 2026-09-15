@@ -189,11 +189,18 @@ def optimize_frame_scales_gtsam(
     force_full_iters: bool = False,
     min_matches_for_node_freeze: int = 0,
     min_matches_for_edge_drop: int = 0,
+    solver: str = "gtsam",
 ) -> np.ndarray:
     """
     Optimize per-image depth scales with GTSAM using 3D point distance residuals.
+
+    solver: "gtsam" (one CustomFactor per match) or "numpy" (_optimize_component_scales_numpy: the same objective and LM
+    schedule, vectorized). print_scales_each_iter / force_full_iters always use gtsam.
     """
-    if gtsam is None:
+    if solver not in ("gtsam", "numpy"):
+        raise ValueError(f"solver must be 'gtsam' or 'numpy', got {solver!r}.")
+    use_numpy = solver == "numpy" and not (print_scales_each_iter or force_full_iters)
+    if not use_numpy and gtsam is None:
         raise ImportError("gtsam is required for optimize_frame_scales_gtsam. Please install python-gtsam.")
 
     start_total_time = time.perf_counter()
@@ -333,7 +340,6 @@ def optimize_frame_scales_gtsam(
 
     start_optimize_time = time.perf_counter()
     for comp_idx, (comp_indices, comp_obs) in enumerate(zip(components, obs_by_component)):
-        graph = gtsam.NonlinearFactorGraph()
         comp_frozen = set(comp_indices) & frozen_indices_global
         anchor_idx = _select_most_connected_anchor(comp_indices, comp_obs, comp_frozen)
         msg = (
@@ -341,6 +347,28 @@ def optimize_frame_scales_gtsam(
             % (comp_idx + 1, len(components), anchor_idx, len(comp_indices), len(comp_obs))
         )
         print(f"{_ANSI_YELLOW}{_FRAME_LOG_PREFIX} {msg}{_ANSI_RESET}", flush=True)
+        if use_numpy:
+            local = {idx: n_local for n_local, idx in enumerate(comp_indices)}
+            v_opt = _optimize_component_scales_numpy(
+                num_vars=len(comp_indices),
+                var_i=np.array([local[m["i"]] for m in comp_obs], dtype=np.int64),
+                var_j=np.array([local[m["j"]] for m in comp_obs], dtype=np.int64),
+                base_diff=np.array([np.asarray(m["b_i"], np.float64) - np.asarray(m["b_j"], np.float64) for m in comp_obs]),
+                dir_i=np.array([np.asarray(m["c_i"], np.float64) for m in comp_obs]),
+                dir_j=np.array([np.asarray(m["c_j"], np.float64) for m in comp_obs]),
+                prior_weight=_prior_weights(
+                    len(comp_indices), [local[anchor_idx]], anchor_prior_sigma, reg_weight,
+                    frozen_vars=[local[idx] for idx in comp_frozen],
+                ),
+                prior_val=anchor_val,
+                robust_delta=robust_delta,
+                use_exp_param=use_exp_param,
+                iters=iters,
+            )
+            for idx in comp_indices:
+                scales[idx] = _value_to_scale(float(v_opt[local[idx]]), use_exp_param)
+            continue
+        graph = gtsam.NonlinearFactorGraph()
         anchor_key = _make_variable_key(use_exp_param, anchor_idx)
         if anchor_prior_sigma is not None and anchor_prior_sigma > 0.0:
             graph.add(
@@ -497,25 +525,24 @@ def _optimize_component_scales_numpy(
     base_diff: np.ndarray,
     dir_i: np.ndarray,
     dir_j: np.ndarray,
-    anchor_var: int,
-    anchor_val: float,
-    anchor_sigma: float,
-    reg_sigma: Optional[float],
+    prior_weight: np.ndarray,
+    prior_val: float,
     robust_delta: float,
     use_exp_param: bool,
     iters: int,
 ) -> np.ndarray:
-    """Vectorized equivalent of the per-component gtsam graph in optimize_submap_scales_gtsam.
+    """Vectorized equivalent of the per-component gtsam graphs of optimize_submap_scales_gtsam and
+    optimize_frame_scales_gtsam.
 
-    Point residuals r = base_diff + g(v_i) * dir_i - g(v_j) * dir_j, with g = exp (use_exp_param) or identity and dir_*
-    already multiplied by the current scales, under a Huber(robust_delta) loss on |r| (unit isotropic noise); a Gaussian
-    anchor prior and optional Gaussian regularization priors on v. Optimized with gtsam's Levenberg-Marquardt schedule
+    Point residuals r = base_diff + g(v_i) * dir_i - g(v_j) * dir_j, with g = exp (use_exp_param) or identity, under a
+    Huber(robust_delta) loss on |r| (unit isotropic noise), plus Gaussian priors 0.5 * prior_weight * (v - prior_val)^2
+    (prior_weight = sum of 1 / sigma^2 over the PriorFactorDouble terms on that variable: anchor, freeze and
+    regularization priors). Optimized with gtsam's Levenberg-Marquardt schedule
     (default LevenbergMarquardtParams: lambda 1e-5 x/÷ 10 up to 1e5, min model fidelity 1e-3, relative and absolute
     error tolerance 1e-5, iterative reweighting of the robust loss at each linearization), so the result matches the
     gtsam solve to its convergence tolerance without one Python callback per point per iteration."""
     k = float(robust_delta)
-    reg_w = 0.0 if reg_sigma is None else 1.0 / reg_sigma**2
-    anchor_w = 1.0 / anchor_sigma**2
+    prior_weight = np.asarray(prior_weight, dtype=np.float64)
 
     def point_terms(v):
         gi = np.exp(v[var_i]) if use_exp_param else v[var_i]
@@ -531,9 +558,7 @@ def _optimize_component_scales_numpy(
         r, _, _ = point_terms(v)
         d = np.linalg.norm(r, axis=1)
         loss = np.where(d <= k, 0.5 * d * d, k * d - 0.5 * k * k).sum()
-        loss += 0.5 * anchor_w * (v[anchor_var] - anchor_val) ** 2
-        if reg_w > 0.0:
-            loss += 0.5 * reg_w * np.sum((v - anchor_val) ** 2)
+        loss += 0.5 * np.sum(prior_weight * (v - prior_val) ** 2)
         return float(loss)
 
     def linearize(v):
@@ -548,16 +573,12 @@ def _optimize_component_scales_numpy(
         np.add.at(h, (var_j, var_i), cross)
         g = np.bincount(var_i, (ai * b).sum(1), num_vars) + np.bincount(var_j, (aj * b).sum(1), num_vars)
         bb = float((b * b).sum())
-        h[anchor_var, anchor_var] += anchor_w
-        g[anchor_var] += anchor_w * (anchor_val - v[anchor_var])
-        bb += anchor_w * (v[anchor_var] - anchor_val) ** 2
-        if reg_w > 0.0:
-            h[np.diag_indices(num_vars)] += reg_w
-            g += reg_w * (anchor_val - v)
-            bb += reg_w * float(np.sum((v - anchor_val) ** 2))
+        h[np.diag_indices(num_vars)] += prior_weight
+        g += prior_weight * (prior_val - v)
+        bb += float(np.sum(prior_weight * (v - prior_val) ** 2))
         return h, g, 0.5 * bb
 
-    v = np.full(num_vars, anchor_val, dtype=np.float64)
+    v = np.full(num_vars, prior_val, dtype=np.float64)
     current_error = error(v)
     lam, lam_factor, lam_max, min_fidelity, rel_tol, abs_tol = 1e-5, 10.0, 1e5, 1e-3, 1e-5, 1e-5
     iterations = 0
@@ -601,6 +622,21 @@ def _optimize_component_scales_numpy(
         if current_error <= 0.0 or decrease <= abs_tol or decrease / prev_error <= rel_tol:
             break
     return v
+
+
+def _prior_weights(num_vars: int, anchor_vars, anchor_sigma: Optional[float], reg_weight: float,
+                   frozen_vars=(), frozen_sigma: float = 1e-6) -> np.ndarray:
+    """Per-variable sum of 1 / sigma^2 of the PriorFactorDouble terms the gtsam graphs add: anchor (if anchor_sigma),
+    freeze and regularization (reg_weight = 1 / sigma_reg^2 on every variable) priors."""
+    w = np.zeros(num_vars, dtype=np.float64)
+    if anchor_sigma is not None and anchor_sigma > 0.0:
+        for a in anchor_vars:
+            w[a] += 1.0 / anchor_sigma**2
+    for f in frozen_vars:
+        w[f] += 1.0 / frozen_sigma**2
+    if reg_weight > 0.0:
+        w += reg_weight
+    return w
 
 
 def optimize_submap_scales_gtsam(
@@ -995,10 +1031,8 @@ def optimize_submap_scales_gtsam(
                 base_diff=np.concatenate(base_diff),
                 dir_i=np.concatenate(dir_i),
                 dir_j=np.concatenate(dir_j),
-                anchor_var=local[anchor_idx],
-                anchor_val=anchor_val,
-                anchor_sigma=anchor_sigma,
-                reg_sigma=(1.0 / math.sqrt(reg_weight)) if reg_weight > 0.0 else None,
+                prior_weight=_prior_weights(len(comp_indices), [local[anchor_idx]], anchor_sigma, reg_weight),
+                prior_val=anchor_val,
                 robust_delta=robust_delta,
                 use_exp_param=use_exp_param,
                 iters=iters,
