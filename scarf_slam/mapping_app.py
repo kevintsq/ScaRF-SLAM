@@ -105,6 +105,41 @@ ANSI_YELLOW = "\033[93m"
 ANSI_RESET = "\033[0m"
 
 
+def _clone_tensors(x):
+    if isinstance(x, torch.Tensor):
+        return x.clone()
+    if isinstance(x, dict):
+        return type(x)({k: _clone_tensors(v) for k, v in x.items()})
+    if isinstance(x, (list, tuple)):
+        return type(x)(_clone_tensors(v) for v in x)
+    return x
+
+
+class _EagerFirstCallCompiled(torch.nn.Module):
+    """torch.compile(mode="reduce-overhead") wrapper for the depth model. The first call runs eagerly so the DA3 RoPE caches
+    (patch positions, cos/sin tables) hold ordinary tensors; filled inside a CUDA graph, the next replay would overwrite them.
+    Every later call starts a new CUDA graph step and returns cloned outputs, which stay valid after the next replay."""
+
+    def __init__(self, module: torch.nn.Module, mode: str):
+        super().__init__()
+        self.module = module
+        self.compiled = torch.compile(module, mode=mode)
+        self.warm = False
+
+    def forward(self, *args, **kwargs):
+        if not self.warm:
+            self.warm = True
+            return self.module(*args, **kwargs)
+        torch.compiler.cudagraph_mark_step_begin()
+        return _clone_tensors(self.compiled(*args, **kwargs))
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
+
 def _iter_manifest_timestamp_keys(value) -> Set[str]:
     timestamp_keys: Set[str] = set()
     if isinstance(value, dict):
@@ -1788,10 +1823,42 @@ class ScaRFSLAM():
             )
 
         # --- load model ---
-        if self.model_name == "da":
+        if self.model_name == "da" and self.config.get("da3_trt_engine"):
+            # single-view DA3 as a TensorRT engine (Jetson deployment): mono path, VIO extrinsics attached downstream
+            from scarf_slam.backends.da3_mono_trt import DA3MonoTrt
+            self.model = DA3MonoTrt(self.config["da3_trt_engine"]); self.da3_is_mono = True
+        elif self.model_name == "da":
             from depth_anything_3.api import DepthAnything3
-            da3_id = self.config.get("da3_model", "depth-anything/DA3NESTED-GIANT-LARGE")
-            self.model = DepthAnything3.from_pretrained(da3_id).to(device=self.device)
+            da3_id = self.config.get("da3_model", "depth-anything/DA3NESTED-GIANT-LARGE-1.1")
+            print(f"[scarf] depth model: {da3_id}")
+            self.da3_is_mono = any(k in da3_id.upper() for k in ("MONO", "METRIC"))   # single-view checkpoints: no pose estimation, uniform confidence
+            _ck = (da3_id, str(self.device))
+            _cache = globals().setdefault("_DA3_MODEL_CACHE", {})
+            if _ck not in _cache:  # a long-lived process reuses the weights, saving the ~20 s reload per run
+                _m = None
+                try:  # fast path: construct on the CUDA device (no second copy on the host) and read the safetensors straight into it
+                    import json as _json, torch as _torch
+                    from huggingface_hub import hf_hub_download as _dl
+                    from safetensors.torch import load_file as _lf
+                    _cfg = _json.load(open(_dl(da3_id, "config.json")))
+                    with _torch.device(self.device):
+                        _m = DepthAnything3(model_name=_cfg.get("model_name", da3_id.split("/")[-1].lower()))
+                    _sd = _lf(_dl(da3_id, "model.safetensors"), device=str(self.device))
+                    _m.load_state_dict(_sd, strict=False)  # the checkpoint carries no aux-head weights, as the official loader also allows
+                    _m = _m.eval()
+                except Exception as _e:
+                    print(f"[scarf] fast-load fallback ({type(_e).__name__}: {str(_e)[:80]})")
+                    _m = DepthAnything3.from_pretrained(da3_id).to(device=self.device)
+                _cache[_ck] = _m
+            self.model = _cache[_ck]
+            if self.config.get("da3_trt_nested"):
+                # the nested giant with both of its networks as TensorRT engines (scarf_slam/backends/da3_nested_trt.py); the api object keeps
+                # only its pre/post-processing, the torch networks are released
+                from scarf_slam.backends.da3_nested_trt import DA3NestedTrt
+                import torch as _torch
+                self.model.model = DA3NestedTrt(self.config["da3_trt_nested"], views=int(self.config.get("da3_trt_views", 6)),
+                                             height=int(self.config.get("da3_trt_height", 378)), width=int(self.config.get("da3_trt_width", 504)))
+                _cache.pop(_ck, None); _torch.cuda.empty_cache()
             if self.config.get("torch_compile", False):
                 # Compile only when requested; warmup batches are slower.
                 compile_mode = self.config.get("torch_compile_mode", "default")
@@ -1799,7 +1866,10 @@ class ScaRFSLAM():
                     f"[scarf] torch.compile depth model (mode={compile_mode}); "
                     "expect slow warmup batches while compiling"
                 )
-                self.model.model = torch.compile(self.model.model, mode=compile_mode)
+                if compile_mode == "reduce-overhead":
+                    self.model.model = _EagerFirstCallCompiled(self.model.model, compile_mode)
+                else:
+                    self.model.model = torch.compile(self.model.model, mode=compile_mode)
         else:
             raise ValueError(f"Invalid self.model_name: {self.model_name}")
 
