@@ -1497,6 +1497,9 @@ class ScaRFSLAM():
         predictions.conf = np.where(predictions.depth > max_distance_threshold, 0, predictions.conf)
         # predictions.depth = np.where(predictions.depth > max_distance_threshold, 0, predictions.depth)
 
+        _nz_conf = predictions.conf[predictions.conf != 0]   # after the sky / range zeroing: a uniform NONZERO conf (mono models) carries no ranking to filter on
+        if _nz_conf.size == 0 or np.ptp(_nz_conf) == 0:
+            return predictions
         conf_threshold = np.percentile(predictions.conf[predictions.conf != 0], conf_thresh_percentile)
         predictions.conf[predictions.conf <= conf_threshold] = 0.0
         # predictions.depth[predictions.conf < conf_threshold] = 0.0
@@ -2009,7 +2012,7 @@ class ScaRFSLAM():
                     ref_ts_sub, 
                     self.in_ref_poses_dict,
                     self.ph_views_per_batch,
-                    use_extrinsics=True,
+                    use_extrinsics=not getattr(self, "da3_is_mono", False),
                 )
                 predictions, ph_view_poses_sub, new_ph_to_ref_dict = da_out
             else:

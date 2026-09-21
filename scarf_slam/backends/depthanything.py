@@ -144,11 +144,12 @@ def do_processing(app, ts_sub, in_poses_dict, ph_views_per_batch, use_extrinsics
             image=image_data_lst,
             intrinsics=intrinsics_array,
         )
-        raise NotImplementedError(
-            "Requires additional implementation to align the predicted depth scale "
-            "with the SLAM pose scale and to overwrite predictions.intrinsics and "
-            "predictions.extrinsics with the calibrated intrinsics and SLAM poses."
-        )
+        # single-view models (DA3MONO) estimate no poses: downstream needs the input VIO extrinsics
+        predictions.extrinsics = np.stack(extrinsics_lst, axis=0).astype(np.float32)
+        # mono predictions carry no confidence; a uniform map keeps the percentile filter a no-op
+        _conf = getattr(predictions, "conf", None)
+        if _conf is None or np.asarray(_conf).dtype == object:
+            predictions.conf = np.ones(np.asarray(predictions.depth).shape, dtype=np.float32)
 
     # if torch.cuda.is_available():
     #     torch.cuda.synchronize()
