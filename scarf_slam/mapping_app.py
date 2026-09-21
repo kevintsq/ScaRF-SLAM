@@ -2098,7 +2098,6 @@ class ScaRFSLAM():
             extrinsics_t,
             device=fusion_device,
         )
-        pts_world_batch = pts_world_batch_t.cpu().numpy()
         t_view_world_batch_t = torch.eye(4, dtype=torch.float32, device=fusion_device).repeat(N, 1, 1)
         t_view_world_batch_t[:, :3, :4] = extrinsics_t
         intrinsics_params = [
@@ -2111,146 +2110,24 @@ class ScaRFSLAM():
             for i in range(N)
         ]
 
-        submap_point_ids: Dict[str, np.ndarray] = {}
-        submap_pts_world = np.empty((0, 4), dtype=np.float32)
-        submap_colors = np.empty((0, 3), dtype=np.uint8)
-        submap_point_count = 0
-
-        def _ensure_submap_capacity(min_capacity: int) -> None:
-            nonlocal submap_pts_world, submap_colors, submap_point_count
-            current_capacity = submap_pts_world.shape[0]
-            if current_capacity >= min_capacity:
-                return
-
-            new_capacity = max(
-                min_capacity,
-                1024 if current_capacity == 0 else current_capacity * 2,
-            )
-            while new_capacity < min_capacity:
-                new_capacity *= 2
-
-            new_pts = np.empty((new_capacity, 4), dtype=np.float32)
-            new_colors = np.empty((new_capacity, 3), dtype=np.uint8)
-            if submap_point_count > 0:
-                new_pts[:submap_point_count] = submap_pts_world[:submap_point_count]
-                new_colors[:submap_point_count] = submap_colors[:submap_point_count]
-            submap_pts_world = new_pts
-            submap_colors = new_colors
-
-        def _append_submap_points(pts_unmatched: np.ndarray, rgb_unmatched: np.ndarray) -> np.ndarray:
-            nonlocal submap_pts_world, submap_colors, submap_point_count
-            n_new = int(pts_unmatched.shape[0])
-            if n_new == 0:
-                return np.empty((0,), dtype=np.int64)
-
-            start_idx = submap_point_count
-            end_idx = start_idx + n_new
-            _ensure_submap_capacity(end_idx)
-            submap_pts_world[start_idx:end_idx] = pts_unmatched
-            submap_colors[start_idx:end_idx] = rgb_unmatched
-            submap_point_count = end_idx
-            return np.arange(start_idx, end_idx, dtype=np.int64)
-
-        # Point cloud fusion
+        # Point cloud fusion (scarf_slam/mapping/fusion.py: fuse_submap_frames; SCARF_FUSION_GPU=0 selects the original numpy loop)
         fusion_start_time = time.perf_counter()
+        ts_keys = [_get_ts_key(est_poses_sub, i) for i in range(N)]
+        if os.environ.get("SCARF_FUSION_DUMP") and not getattr(self, "_fusion_dumped", 0) >= 5:   # debug: inputs of the first submaps for the numpy-vs-gpu test
+            self._fusion_dumped = getattr(self, "_fusion_dumped", 0) + 1
+            np.savez(os.path.join(os.environ["SCARF_FUSION_DUMP"], f"fusion_in_{self._fusion_dumped}.npz"), imgs=imgs, confs=confs, pts=pts_world_batch_t.cpu().numpy(),
+                     depths=depths, tvw=t_view_world_batch_t.cpu().numpy(), intr=np.array(intrinsics_params, dtype=np.float64), keys=np.array(ts_keys),
+                     overlap=self.overlap_ph_views, pcf=bool(self.point_cloud_fusion))
+        submap_pts_world, submap_colors, submap_point_ids = map_fusion.fuse_submap_frames(
+            imgs, confs, pts_world_batch_t, depths_t, t_view_world_batch_t, intrinsics_params, ts_keys, self.overlap_ph_views,
+            bool(self.point_cloud_fusion), gpu=os.environ.get("SCARF_FUSION_GPU", "1") != "0")
+        submap_point_count = submap_pts_world.shape[0]
         for i in range(N):
-            depth_i = depths[i]
-            conf_i = confs[i]
-            img_i = imgs[i]
-            pts_world_i = pts_world_batch[i]
-            pts_world_i_flat = pts_world_i.reshape(-1, 3)
-            ts_key_i = _get_ts_key(est_poses_sub, i)
-
-            pts_world_ids = np.full((H, W), -1, dtype=np.int64)
-
-            if submap_point_count > 0:
-                for project_idx in range(i - 1, max(-1, i - self.overlap_ph_views - 1), -1):
-                    if project_idx == i:
-                        continue
-
-                    ts_key_old = _get_ts_key(est_poses_sub, project_idx)
-                    if ts_key_old not in submap_point_ids:
-                        continue
-
-                    pts_world_ids_old = submap_point_ids[ts_key_old]
-                    if self.point_cloud_fusion:
-                        matching_unique = map_fusion.get_matching_torch(
-                            pts_world_1=pts_world_batch_t[i],
-                            mask_1=(pts_world_ids == -1),
-                            depth_2=depths_t[project_idx],
-                            T_view_world_2=t_view_world_batch_t[project_idx],
-                            intrinsics_2=intrinsics_params[project_idx],
-                            depth_thresh=0.05,
-                            unique_mapping=True,
-                        )
-                    else:
-                        matching_unique = np.full((H, W, 2), -1, dtype=np.int32)
-
-                    matching_unique[pts_world_ids != -1] = -1
-                    rows = matching_unique[:, :, 0]
-                    cols = matching_unique[:, :, 1]
-                    fill_mask = (rows >= 0) & (cols >= 0)
-                    if np.any(fill_mask):
-                        matched_rows = rows[fill_mask].astype(np.int64)
-                        matched_cols = cols[fill_mask].astype(np.int64)
-                        prev_ids = pts_world_ids_old[matched_rows, matched_cols]
-                        existing_ids = pts_world_ids[pts_world_ids != -1]
-                        unique_mask = ~np.isin(prev_ids, existing_ids)
-                        fill_idx = np.flatnonzero(fill_mask)
-                        pts_world_ids.flat[fill_idx[unique_mask]] = prev_ids[unique_mask]
-
-                    if np.all(pts_world_ids != -1):
-                        break
-
-                fill_mask = pts_world_ids != -1
-                if np.any(fill_mask):
-                    matched_ids = pts_world_ids[fill_mask]
-                    colors_new = img_i[fill_mask].astype(np.uint8)
-                    pts_new = pts_world_i[fill_mask].astype(np.float32)
-                    conf_new = conf_i[fill_mask].astype(np.float32)
-                    colors_matched = submap_colors[matched_ids].astype(np.uint8, copy=False)
-                    pts_matched = submap_pts_world[matched_ids, :3].astype(np.float32, copy=False)
-                    conf_matched = submap_pts_world[matched_ids, 3].astype(np.float32, copy=False)
-
-                    fused_colors, fused_pts, fused_conf = map_fusion.fuse_overlaps_torch(
-                        colors_1=colors_new,
-                        pts_world_1=pts_new,
-                        conf_1=conf_new,
-                        colors_2=colors_matched,
-                        pts_world_2=pts_matched,
-                        conf_2=conf_matched,
-                    )
-                    submap_colors[matched_ids] = fused_colors.astype(np.uint8)
-                    submap_pts_world[matched_ids, :3] = fused_pts.astype(np.float32)
-                    submap_pts_world[matched_ids, 3] = fused_conf.astype(np.float32)
-
-            vals = pts_world_ids[pts_world_ids != -1]
-            if np.unique(vals).size != vals.size:
-                raise ValueError("pts_world_ids contains duplicate IDs (excluding -1)")
-
-            unmatched_mask = pts_world_ids == -1
-            flat_unmatched_mask = unmatched_mask.ravel()
-            if np.any(flat_unmatched_mask):
-                pts_unmatched_xyz = pts_world_i_flat[flat_unmatched_mask].astype(np.float32, copy=False)
-                conf_unmatched = conf_i.ravel()[flat_unmatched_mask].astype(np.float32, copy=False)
-                pts_unmatched = np.empty((pts_unmatched_xyz.shape[0], 4), dtype=np.float32)
-                pts_unmatched[:, :3] = pts_unmatched_xyz
-                pts_unmatched[:, 3] = conf_unmatched
-                rgb_flat = img_i.reshape(-1, 3)
-                rgb_unmatched = rgb_flat[flat_unmatched_mask]
-                if pts_unmatched.shape[0] > 0:
-                    new_ids = _append_submap_points(pts_unmatched, rgb_unmatched)
-                    pts_world_ids_flat = pts_world_ids.ravel()
-                    pts_world_ids_flat[flat_unmatched_mask] = new_ids
-                    pts_world_ids = pts_world_ids_flat.reshape(H, W)
-
-            submap_point_ids[ts_key_i] = pts_world_ids.copy()
-
             E = np.eye(4, dtype=np.float32)
             E[:3, :4] = extrinsics[i]
             camera_pose = self.transforms.matrix_to_pose(np.linalg.inv(E))
             poses_out.append((est_poses_sub[i][0], camera_pose))
-            self.out_ph_poses_dict[_get_ts_key(est_poses_sub, i)] = camera_pose
+            self.out_ph_poses_dict[ts_keys[i]] = camera_pose
         pts_fusion_duration = self._add_elapsed_time("fuse_pts_time", fusion_start_time)
 
         # Validate point-id maps and anchor (for debugging only).
