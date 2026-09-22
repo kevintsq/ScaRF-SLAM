@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import io
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Tuple
+from collections import OrderedDict
+from typing import Dict, Iterator, List, Mapping, Optional, Tuple
 
 import cv2
 import imageio.v2 as imageio
@@ -96,6 +98,19 @@ def _array_or_bytes_to_bytes(data) -> bytes:
     return np.asarray(data, dtype=np.uint8).tobytes()
 
 
+class _ImageFilePayloads(Mapping):
+    """The image-folder input as a mapping of the same shape as the bag's compressed images, read from disk on demand.
+    Holding every payload costs ~2.8 MB per frame, i.e. tens of GB on a long sequence, for data the app reads once."""
+
+    def __init__(self, paths: Dict[str, Path]): self._paths = dict(paths)
+
+    def __getitem__(self, key: str) -> bytes: return _compressed_image_payload(self._paths[key])[1].tobytes()
+
+    def __iter__(self) -> Iterator[str]: return iter(self._paths)
+
+    def __len__(self) -> int: return len(self._paths)
+
+
 @dataclass
 class SlamBagData:
     bag_path: Path
@@ -104,7 +119,11 @@ class SlamBagData:
     compressed_images: Dict[str, bytes]
     image_formats: Dict[str, str] = field(default_factory=dict)
     image_camera: str = "cam0"
-    _decoded_images: Dict[str, np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    _decoded_images: "OrderedDict[str, np.ndarray]" = field(default_factory=OrderedDict, init=False, repr=False)
+    # A decoded frame is ~11 MB at 1920x1920, so caching every frame of a long sequence costs tens of GB. Measured over a
+    # 5391-frame run: 500 reads covered 417 distinct frames and every hit was on the frame read immediately before
+    # (reuse distance 1), so a handful of entries captures all of the reuse. SCARF_IMAGE_CACHE=0 restores the old behaviour.
+    image_cache_size: int = int(os.environ.get("SCARF_IMAGE_CACHE", 8))
 
     @property
     def trajectory_snapshot_timestamps(self) -> List[str]:
@@ -142,6 +161,10 @@ class SlamBagData:
             elif img.ndim == 3 and img.shape[2] == 4:
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
             self._decoded_images[timestamp] = img
+            if self.image_cache_size:
+                while len(self._decoded_images) > self.image_cache_size: self._decoded_images.popitem(last=False)
+        else:
+            self._decoded_images.move_to_end(timestamp)
         return self._decoded_images[timestamp]
 
 
@@ -290,13 +313,13 @@ def load_image_folder_and_poses(
     image_files = _collect_image_files(resolved_image_folder)
     poses = read_pose_file(poses_path)
 
-    compressed_images: Dict[str, bytes] = {}
+    image_paths: Dict[str, Path] = {}
     image_formats: Dict[str, str] = {}
     for timestamp_nsec, image_path in image_files:
-        image_format, payload = _compressed_image_payload(image_path)
         key = _timestamp_nsec_key(timestamp_nsec)
-        compressed_images[key] = payload.tobytes()
-        image_formats[key] = image_format
+        image_paths[key] = image_path
+        image_formats[key] = image_path.suffix.lstrip(".").lower() or "jpeg"
+    compressed_images = _ImageFilePayloads(image_paths)   # read on demand: the folder is already on disk
 
     pose_dict: Dict[str, MappingPose] = {}
     last_pose_nsec: Optional[int] = None
