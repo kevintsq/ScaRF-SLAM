@@ -1,5 +1,6 @@
 import math
 import logging
+import os
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, TypeAlias
@@ -175,6 +176,143 @@ def _select_most_connected_anchor(
     return max(candidate_indices, key=_score)
 
 
+
+def _optimize_frame_scales_numpy_arrays(predictions, matches, keypoints, iters, robust_delta, use_exp_param, reg_weight,
+                                        anchor_prior_sigma, normalize_mean, min_matches_for_node_freeze,
+                                        min_matches_for_edge_drop, start_total_time) -> np.ndarray:
+    """optimize_frame_scales_gtsam(solver="numpy") on arrays instead of one Python dict per match: the same filters,
+    edge dropping, node freezing, components, anchor choice, log lines and solver inputs in the same order, and the
+    unprojection as a batched matmul, which is bit-identical to the per-match 3x3 @ 3 products (checked on recorded
+    CityPark calls). About 10x faster; the per-match Python work was most of the frame-scale cost on the Jetson."""
+    geom = _prepare_geometry(predictions)
+    depth, k_inv, r_c2w, t_c2w = geom["depth"], geom["k_inv"], geom["r_c2w"], geom["t_c2w"]
+    n = int(geom["n"][0])
+    ii, jj, ui, vi, uj, vj = [], [], [], [], [], []
+    for (i, j), pairs in matches.items():
+        if len(pairs) == 0:
+            continue
+        kps_i, kps_j = keypoints[i], keypoints[j]
+        pi = np.array([kps_i[q].pt for q, _ in pairs], dtype=np.float64).reshape(-1, 2)
+        pj = np.array([kps_j[p].pt for _, p in pairs], dtype=np.float64).reshape(-1, 2)
+        ii.append(np.full(len(pairs), i, np.int64)); jj.append(np.full(len(pairs), j, np.int64))
+        ui.append(pi[:, 0]); vi.append(pi[:, 1]); uj.append(pj[:, 0]); vj.append(pj[:, 1])
+    if len(ii) == 0:
+        msg = "No matches provided for optimization; skip optimization and return all-one scales."
+        print(f"{_ANSI_YELLOW}{_FRAME_LOG_PREFIX} {msg}{_ANSI_RESET}", flush=True)
+        return np.ones((n,), dtype=np.float32)
+    start_observation_time = time.perf_counter()
+    I, J = np.concatenate(ii), np.concatenate(jj)
+    UI, VI, UJ, VJ = np.concatenate(ui), np.concatenate(vi), np.concatenate(uj), np.concatenate(vj)
+    h, w = depth.shape[1], depth.shape[2]
+    cui, cvi, cuj, cvj = UI.astype(np.int64), VI.astype(np.int64), UJ.astype(np.int64), VJ.astype(np.int64)   # int(): toward zero
+    keep = (cui >= 0) & (cui < w) & (cvi >= 0) & (cvi < h) & (cuj >= 0) & (cuj < w) & (cvj >= 0) & (cvj < h)
+    I, J, UI, VI, UJ, VJ = I[keep], J[keep], UI[keep], VI[keep], UJ[keep], VJ[keep]
+    d_i = depth[I, cvi[keep], cui[keep]].astype(np.float64)
+    d_j = depth[J, cvj[keep], cuj[keep]].astype(np.float64)
+    keep = np.isfinite(d_i) & np.isfinite(d_j) & (d_i > 0) & (d_j > 0)
+    I, J, UI, VI, UJ, VJ, d_i, d_j = I[keep], J[keep], UI[keep], VI[keep], UJ[keep], VJ[keep], d_i[keep], d_j[keep]
+    if I.size == 0:
+        raise ValueError("All matches invalid after depth filtering.")
+
+    def unproject(F, U, V, d):
+        pix = np.stack([U, V, np.ones_like(U)], axis=1)[:, :, None]
+        ray = (k_inv[F] @ pix)[:, :, 0] * d[:, None]
+        return (r_c2w[F] @ ray[:, :, None])[:, :, 0], t_c2w[F]
+
+    c_i, b_i = unproject(I, UI, VI, d_i)
+    c_j, b_j = unproject(J, UJ, VJ, d_j)
+    end_observation_time = time.perf_counter()
+
+    if min_matches_for_edge_drop < 0 or min_matches_for_node_freeze < 0:
+        raise ValueError("min_matches_for_edge_drop and min_matches_for_node_freeze must be non-negative.")
+    edge_code = I * max(n, 1) + J
+    codes, counts = np.unique(edge_code, return_counts=True)
+    raw_edge_counts = {(int(c) // max(n, 1), int(c) % max(n, 1)): int(k) for c, k in zip(codes, counts)}
+    if min_matches_for_edge_drop > 0:
+        drop_codes = codes[counts < min_matches_for_edge_drop]
+        if drop_codes.size:
+            keep = ~np.isin(edge_code, drop_codes)
+            I, J, c_i, b_i, c_j, b_j = I[keep], J[keep], c_i[keep], b_i[keep], c_j[keep], b_j[keep]
+            if I.size == 0:
+                msg = "No matches left after dropping edges with count below min_matches_for_edge_drop."
+                print(f"{_ANSI_YELLOW}{_FRAME_LOG_PREFIX} {msg}{_ANSI_RESET}", flush=True)
+                return np.ones((n,), dtype=np.float32)
+            msg = "Dropped %d edges with count < min_matches_for_edge_drop=%d." % (int(drop_codes.size), min_matches_for_edge_drop)
+            print(f"{_ANSI_YELLOW}{_FRAME_LOG_PREFIX} {msg}{_ANSI_RESET}", flush=True)
+    frozen_indices_global: Set[int] = set()
+    if min_matches_for_node_freeze > 0:
+        node_match_totals: Dict[int, int] = defaultdict(int)
+        related_nodes: Set[int] = set()
+        for (i, j), cnt in raw_edge_counts.items():
+            if i == j:
+                continue
+            node_match_totals[i] += cnt; node_match_totals[j] += cnt
+            related_nodes.add(i); related_nodes.add(j)
+        frozen_indices_global = {idx for idx in related_nodes if node_match_totals.get(idx, 0) < min_matches_for_node_freeze}
+
+    active_indices = sorted(set(I.tolist()) | set(J.tolist()))
+    uniq_edges = np.unique(np.stack([I, J], 1), axis=0)
+    components = _build_connected_components(active_indices, [(int(a), int(b)) for a, b in uniq_edges])
+    largest_component_size = max((len(comp) for comp in components), default=0)
+    if largest_component_size < 3:
+        msg = ("Largest connected component has %d node(s) (< 3); skip optimization and return all-one scales." % largest_component_size)
+        print(f"{_ANSI_YELLOW}{_FRAME_LOG_PREFIX} {msg}{_ANSI_RESET}", flush=True)
+        return np.ones((n,), dtype=np.float32)
+    if len(components) > 1:
+        msg = ("Optimizing %d disconnected GTSAM components independently (active_vars=%d, match_factors=%d)."
+               % (len(components), len(active_indices), int(I.size)))
+        print(f"{_ANSI_YELLOW}{_FRAME_LOG_PREFIX} {msg}{_ANSI_RESET}", flush=True)
+    if len(frozen_indices_global) > 0:
+        msg = ("Freezing %d nodes with total node matches < min_matches_for_node_freeze=%d." % (len(frozen_indices_global), min_matches_for_node_freeze))
+        print(f"{_ANSI_YELLOW}{_FRAME_LOG_PREFIX} {msg}{_ANSI_RESET}", flush=True)
+
+    scales = np.ones((n,), dtype=np.float64)
+    anchor_val = 0.0 if use_exp_param else 1.0
+    start_optimize_time = time.perf_counter()
+    for comp_idx, comp_indices in enumerate(components):
+        in_comp = np.isin(I, comp_indices) & np.isin(J, comp_indices)
+        cI, cJ = I[in_comp], J[in_comp]
+        comp_frozen = set(comp_indices) & frozen_indices_global
+        # _select_most_connected_anchor on arrays: degree, incident factor count, distance to the midpoint, index
+        candidates = [idx for idx in comp_indices if idx not in comp_frozen] or list(comp_indices)
+        off = cI != cJ
+        inc = defaultdict(int)
+        for k_, c_ in zip(*np.unique(np.concatenate([cI[off], cJ[off]]), return_counts=True)):
+            inc[int(k_)] = int(c_)
+        pairs_u = np.unique(np.stack([np.concatenate([cI[off], cJ[off]]), np.concatenate([cJ[off], cI[off]])], 1), axis=0)
+        deg = defaultdict(int)
+        for k_, c_ in zip(*np.unique(pairs_u[:, 0], return_counts=True)) if pairs_u.size else []:
+            deg[int(k_)] = int(c_)
+        mid = 0.5 * (float(comp_indices[0]) + float(comp_indices[-1]))
+        anchor_idx = max(candidates, key=lambda idx: (deg[idx], inc.get(idx, 0), -abs(float(idx) - mid), -idx))
+        msg = ("Component %d/%d: anchor_idx=%d, nodes=%d, match_factors=%d."
+               % (comp_idx + 1, len(components), anchor_idx, len(comp_indices), int(cI.size)))
+        print(f"{_ANSI_YELLOW}{_FRAME_LOG_PREFIX} {msg}{_ANSI_RESET}", flush=True)
+        lut = np.full(max(n, int(max(comp_indices)) + 1), -1, np.int64); lut[comp_indices] = np.arange(len(comp_indices))
+        local = {idx: n_local for n_local, idx in enumerate(comp_indices)}
+        v_opt = _optimize_component_scales_numpy(
+            num_vars=len(comp_indices), var_i=lut[cI], var_j=lut[cJ],
+            base_diff=b_i[in_comp] - b_j[in_comp], dir_i=c_i[in_comp], dir_j=c_j[in_comp],
+            prior_weight=_prior_weights(len(comp_indices), [local[anchor_idx]], anchor_prior_sigma, reg_weight,
+                                        frozen_vars=[local[idx] for idx in comp_frozen]),
+            prior_val=anchor_val, robust_delta=robust_delta, use_exp_param=use_exp_param, iters=iters)
+        for idx in comp_indices:
+            scales[idx] = _value_to_scale(float(v_opt[local[idx]]), use_exp_param)
+    end_optimize_time = time.perf_counter()
+    if normalize_mean:
+        mean_s = float(scales.mean())
+        if mean_s > 1e-12:
+            scales = scales / mean_s
+    end_total_time = time.perf_counter()
+    observation_time = end_observation_time - start_observation_time
+    optimize_time = end_optimize_time - start_optimize_time
+    total_time = end_total_time - start_total_time
+    other_time = max(0.0, total_time - (observation_time + optimize_time))
+    print(f"{_ANSI_YELLOW}{_FRAME_LOG_PREFIX} Timing: build_observations={observation_time:.6f}s, optimize={optimize_time:.6f}s, "
+          f"other={other_time:.6f}s, total={total_time:.6f}s{_ANSI_RESET}", flush=True)
+    return np.asarray(scales, dtype=np.float32)
+
+
 def optimize_frame_scales_gtsam(
     predictions: Any,
     matches: Dict[Tuple[int, int], List[Tuple[int, int]]],
@@ -204,6 +342,10 @@ def optimize_frame_scales_gtsam(
         raise ImportError("gtsam is required for optimize_frame_scales_gtsam. Please install python-gtsam.")
 
     start_total_time = time.perf_counter()
+    if use_numpy and os.environ.get("SCARF_FRAME_SCALE_LEGACY") != "1":   # the per-match Python path stays available for A/B checks
+        return _optimize_frame_scales_numpy_arrays(predictions, matches, keypoints, iters, robust_delta, use_exp_param, reg_weight,
+                                                   anchor_prior_sigma, normalize_mean, min_matches_for_node_freeze,
+                                                   min_matches_for_edge_drop, start_total_time)
     geom = _prepare_geometry(predictions)
     depth = geom["depth"]
     k_inv = geom["k_inv"]
@@ -543,6 +685,11 @@ def _optimize_component_scales_numpy(
     gtsam solve to its convergence tolerance without one Python callback per point per iteration."""
     k = float(robust_delta)
     prior_weight = np.asarray(prior_weight, dtype=np.float64)
+    if _numba is not None and os.environ.get("SCARF_SCALE_NUMBA", "1") != "0":
+        return _lm_nb(int(num_vars), np.ascontiguousarray(var_i, dtype=np.int64), np.ascontiguousarray(var_j, dtype=np.int64),
+                      np.ascontiguousarray(base_diff, dtype=np.float64), np.ascontiguousarray(dir_i, dtype=np.float64),
+                      np.ascontiguousarray(dir_j, dtype=np.float64), np.ascontiguousarray(prior_weight, dtype=np.float64),
+                      float(prior_val), k, bool(use_exp_param), int(iters))
 
     def point_terms(v):
         gi = np.exp(v[var_i]) if use_exp_param else v[var_i]
@@ -624,6 +771,141 @@ def _optimize_component_scales_numpy(
     return v
 
 
+
+# numba version of _optimize_component_scales_numpy (the same objective and Levenberg-Marquardt schedule, one fused loop per
+# linearization instead of a dozen small numpy calls). It sums in a different order than numpy / BLAS, so results agree to
+# floating-point round-off (and can differ by one accepted LM step near a threshold), not bit for bit. On by default when
+# numba imports; SCARF_SCALE_NUMBA=0 falls back to numpy.
+try:
+    import numba as _numba
+except Exception:  # pragma: no cover
+    _numba = None
+
+if _numba is not None:
+    @_numba.njit(cache=True)
+    def _lm_error_nb(v, var_i, var_j, base_diff, dir_i, dir_j, prior_weight, prior_val, k, use_exp):
+        loss = 0.0
+        for m in range(var_i.shape[0]):
+            gi = np.exp(v[var_i[m]]) if use_exp else v[var_i[m]]
+            gj = np.exp(v[var_j[m]]) if use_exp else v[var_j[m]]
+            d2 = 0.0
+            for a in range(3):
+                r = base_diff[m, a] + gi * dir_i[m, a] - gj * dir_j[m, a]
+                d2 += r * r
+            d = np.sqrt(d2)
+            loss += 0.5 * d * d if d <= k else k * d - 0.5 * k * k
+        for q in range(v.shape[0]):
+            loss += 0.5 * prior_weight[q] * (v[q] - prior_val) ** 2
+        return loss
+
+    @_numba.njit(cache=True)
+    def _lm_linearize_nb(v, var_i, var_j, base_diff, dir_i, dir_j, prior_weight, prior_val, k, use_exp):
+        nv = v.shape[0]
+        h = np.zeros((nv, nv)); g = np.zeros(nv); bb = 0.0
+        for m in range(var_i.shape[0]):
+            i = var_i[m]; j = var_j[m]
+            gi = np.exp(v[i]) if use_exp else v[i]
+            gj = np.exp(v[j]) if use_exp else v[j]
+            r0 = base_diff[m, 0] + gi * dir_i[m, 0] - gj * dir_j[m, 0]
+            r1 = base_diff[m, 1] + gi * dir_i[m, 1] - gj * dir_j[m, 1]
+            r2 = base_diff[m, 2] + gi * dir_i[m, 2] - gj * dir_j[m, 2]
+            d = np.sqrt(r0 * r0 + r1 * r1 + r2 * r2)
+            sw = 1.0 if d <= k else np.sqrt(k / max(d, 1e-300))
+            si = gi if use_exp else 1.0
+            sj = gj if use_exp else 1.0
+            aii = 0.0; ajj = 0.0; aij = 0.0; gbi = 0.0; gbj = 0.0
+            for a, ra in ((0, r0), (1, r1), (2, r2)):
+                ai = si * dir_i[m, a] * sw; aj = -sj * dir_j[m, a] * sw; b = -ra * sw
+                aii += ai * ai; ajj += aj * aj; aij += ai * aj; gbi += ai * b; gbj += aj * b; bb += b * b
+            h[i, i] += aii; h[j, j] += ajj; h[i, j] += aij; h[j, i] += aij
+            g[i] += gbi; g[j] += gbj
+        for q in range(nv):
+            h[q, q] += prior_weight[q]
+            g[q] += prior_weight[q] * (prior_val - v[q])
+            bb += prior_weight[q] * (v[q] - prior_val) ** 2
+        return h, g, 0.5 * bb
+
+    @_numba.njit(cache=True)
+    def _lm_solve_nb(a, b):
+        """Gaussian elimination with partial pivoting; ok = False on a (numerically) singular system."""
+        n = b.shape[0]; m = a.copy(); x = b.copy()
+        for c in range(n):
+            p = c
+            for r in range(c + 1, n):
+                if abs(m[r, c]) > abs(m[p, c]):
+                    p = r
+            if not (abs(m[p, c]) > 1e-300):
+                return x, False
+            if p != c:
+                for q in range(n):
+                    t = m[c, q]; m[c, q] = m[p, q]; m[p, q] = t
+                t = x[c]; x[c] = x[p]; x[p] = t
+            for r in range(c + 1, n):
+                f = m[r, c] / m[c, c]
+                for q in range(c, n):
+                    m[r, q] -= f * m[c, q]
+                x[r] -= f * x[c]
+        for c in range(n - 1, -1, -1):
+            acc = x[c]
+            for q in range(c + 1, n):
+                acc -= m[c, q] * x[q]
+            x[c] = acc / m[c, c]
+        for c in range(n):
+            if not np.isfinite(x[c]):
+                return x, False
+        return x, True
+
+    @_numba.njit(cache=True)
+    def _lm_nb(num_vars, var_i, var_j, base_diff, dir_i, dir_j, prior_weight, prior_val, k, use_exp, iters):
+        v = np.full(num_vars, prior_val)
+        current_error = _lm_error_nb(v, var_i, var_j, base_diff, dir_i, dir_j, prior_weight, prior_val, k, use_exp)
+        lam = 1e-5; lam_factor = 10.0; lam_max = 1e5; min_fidelity = 1e-3; rel_tol = 1e-5; abs_tol = 1e-5
+        eps = 2.220446049250313e-16
+        iterations = 0; prev_error = current_error
+        while True:
+            h, g, old_lin_error = _lm_linearize_nb(v, var_i, var_j, base_diff, dir_i, dir_j, prior_weight, prior_val, k, use_exp)
+            while True:
+                step_ok = False; stop_search = False; new_v = v; new_error = current_error
+                hl = h.copy()
+                for q in range(num_vars):
+                    hl[q, q] += lam
+                delta, solved = _lm_solve_nb(hl, g)
+                if solved:
+                    hd = h @ delta
+                    lin_change = 0.0
+                    for q in range(num_vars):
+                        lin_change += g[q] * delta[q] - 0.5 * delta[q] * hd[q]
+                    if lin_change >= 0.0:
+                        new_v = v + delta
+                        new_error = _lm_error_nb(new_v, var_i, var_j, base_diff, dir_i, dir_j, prior_weight, prior_val, k, use_exp)
+                        cost_change = current_error - new_error
+                        if lin_change > eps * old_lin_error:
+                            step_ok = cost_change / lin_change > min_fidelity
+                        else:
+                            step_ok = True
+                        if abs(cost_change) < rel_tol * current_error:
+                            stop_search = True
+                if step_ok:
+                    lam /= lam_factor
+                    v = new_v; prev_error = current_error; current_error = new_error
+                    iterations += 1
+                    break
+                if not stop_search:
+                    lam *= lam_factor
+                    if lam >= lam_max:
+                        prev_error = current_error
+                        break
+                    continue
+                prev_error = current_error
+                break
+            if iterations >= max(1, iters):
+                break
+            decrease = prev_error - current_error
+            if current_error <= 0.0 or decrease <= abs_tol or decrease / prev_error <= rel_tol:
+                break
+        return v
+
+
 def _prior_weights(num_vars: int, anchor_vars, anchor_sigma: Optional[float], reg_weight: float,
                    frozen_vars=(), frozen_sigma: float = 1e-6) -> np.ndarray:
     """Per-variable sum of 1 / sigma^2 of the PriorFactorDouble terms the gtsam graphs add: anchor (if anchor_sigma),
@@ -637,6 +919,26 @@ def _prior_weights(num_vars: int, anchor_vars, anchor_sigma: Optional[float], re
     if reg_weight > 0.0:
         w += reg_weight
     return w
+
+
+# Per submap-pair point lookups of optimize_submap_scales_gtsam, cached across calls. The lookups (frame point ids ->
+# confidence / finiteness masks -> gathered local points) depend only on arrays a submap never modifies after it is
+# created, but the sliding window recomputed them for every pair on every call. An entry keeps references to the exact
+# arrays it was computed from and is used only if the call sees the same objects (identity), so a replaced submap or a
+# new match result simply misses. The random subsampling still runs on every call in the same order, so results are
+# unchanged. SCARF_SUBMAP_PAIR_CACHE=0 disables it.
+_SUBMAP_PAIR_CACHE: Dict[Tuple, Tuple[Tuple[Any, ...], Any]] = {}
+
+
+def _pair_cache_get(key, refs, compute):
+    if os.environ.get("SCARF_SUBMAP_PAIR_CACHE", "1") == "0":
+        return compute()
+    hit = _SUBMAP_PAIR_CACHE.get(key)
+    if hit is not None and len(hit[0]) == len(refs) and all(a is b for a, b in zip(hit[0], refs)):
+        return hit[1]
+    val = compute()
+    _SUBMAP_PAIR_CACHE[key] = (tuple(refs), val)
+    return val
 
 
 def optimize_submap_scales_gtsam(
@@ -681,6 +983,9 @@ def optimize_submap_scales_gtsam(
     selected_submap_keys = submap_keys[first_submap_idx:]
     selected_submap_count = len(selected_submap_keys)
     selected_key_to_idx = {k: i for i, k in enumerate(selected_submap_keys)}
+    _selected = set(selected_submap_keys)
+    for _k in [k for k in _SUBMAP_PAIR_CACHE if k[1] not in _selected or k[2] not in _selected]:
+        del _SUBMAP_PAIR_CACHE[_k]
     rng = np.random.default_rng(seed=random_seed)
     transforms = MappingTransforms()
 
@@ -811,48 +1116,56 @@ def optimize_submap_scales_gtsam(
             frame_key_b = frame_keys_b[t]
             if frame_key_a != frame_key_b:
                 continue
-            frame_a = np.asarray(getattr(submap_a, "frame_point_ids")[frame_key_a], dtype=np.int64)
-            frame_b = np.asarray(getattr(submap_b, "frame_point_ids")[frame_key_b], dtype=np.int64)
-            if frame_a.shape != frame_b.shape:
-                raise ValueError(
-                    f"Overlap frame shape mismatch between submaps {key_a} and {key_b}: "
-                    f"{frame_a.shape} vs {frame_b.shape}."
+            ids_obj_a = getattr(submap_a, "frame_point_ids")[frame_key_a]
+            ids_obj_b = getattr(submap_b, "frame_point_ids")[frame_key_b]
+
+            def _adjacent_points(ids_obj_a=ids_obj_a, ids_obj_b=ids_obj_b, local_points_a=local_points_a, local_points_b=local_points_b,
+                                 key_a=key_a, key_b=key_b):
+                frame_a = np.asarray(ids_obj_a, dtype=np.int64)
+                frame_b = np.asarray(ids_obj_b, dtype=np.int64)
+                if frame_a.shape != frame_b.shape:
+                    raise ValueError(
+                        f"Overlap frame shape mismatch between submaps {key_a} and {key_b}: "
+                        f"{frame_a.shape} vs {frame_b.shape}."
+                    )
+                valid = (frame_a >= 0) & (frame_b >= 0)
+                if not np.any(valid):
+                    return None
+                ids_a_flat = frame_a[valid].astype(np.int64, copy=False)
+                ids_b_flat = frame_b[valid].astype(np.int64, copy=False)
+                in_range = (
+                    (ids_a_flat >= 0)
+                    & (ids_a_flat < local_points_a.shape[0])
+                    & (ids_b_flat >= 0)
+                    & (ids_b_flat < local_points_b.shape[0])
                 )
+                if not np.any(in_range):
+                    return None
+                ids_a_flat = ids_a_flat[in_range]
+                ids_b_flat = ids_b_flat[in_range]
+                conf_a = local_points_a[ids_a_flat, 3]
+                conf_b = local_points_b[ids_b_flat, 3]
+                valid_conf = np.isfinite(conf_a) & (conf_a > 0.0) & np.isfinite(conf_b) & (conf_b > 0.0)
+                if not np.any(valid_conf):
+                    return None
+                ids_a_flat = ids_a_flat[valid_conf]
+                ids_b_flat = ids_b_flat[valid_conf]
+                p_a = np.asarray(local_points_a[ids_a_flat, :3], dtype=np.float64)
+                p_b = np.asarray(local_points_b[ids_b_flat, :3], dtype=np.float64)
+                finite = np.all(np.isfinite(p_a), axis=1) & np.all(np.isfinite(p_b), axis=1)
+                if not np.any(finite):
+                    return None
+                p_a = p_a[finite]
+                p_b = p_b[finite]
+                if p_a.shape[0] == 0:
+                    return None
+                return p_a, p_b
 
-            valid = (frame_a >= 0) & (frame_b >= 0)
-            if not np.any(valid):
+            got = _pair_cache_get(("adjacent", key_a, key_b, frame_key_a),
+                                  (local_points_a, local_points_b, ids_obj_a, ids_obj_b), _adjacent_points)
+            if got is None:
                 continue
-
-            ids_a_flat = frame_a[valid].astype(np.int64, copy=False)
-            ids_b_flat = frame_b[valid].astype(np.int64, copy=False)
-            in_range = (
-                (ids_a_flat >= 0)
-                & (ids_a_flat < local_points_a.shape[0])
-                & (ids_b_flat >= 0)
-                & (ids_b_flat < local_points_b.shape[0])
-            )
-            if not np.any(in_range):
-                continue
-
-            ids_a_flat = ids_a_flat[in_range]
-            ids_b_flat = ids_b_flat[in_range]
-            conf_a = local_points_a[ids_a_flat, 3]
-            conf_b = local_points_b[ids_b_flat, 3]
-            valid_conf = np.isfinite(conf_a) & (conf_a > 0.0) & np.isfinite(conf_b) & (conf_b > 0.0)
-            if not np.any(valid_conf):
-                continue
-
-            ids_a_flat = ids_a_flat[valid_conf]
-            ids_b_flat = ids_b_flat[valid_conf]
-            p_a = np.asarray(local_points_a[ids_a_flat, :3], dtype=np.float64)
-            p_b = np.asarray(local_points_b[ids_b_flat, :3], dtype=np.float64)
-            finite = np.all(np.isfinite(p_a), axis=1) & np.all(np.isfinite(p_b), axis=1)
-            if not np.any(finite):
-                continue
-            p_a = p_a[finite]
-            p_b = p_b[finite]
-            if p_a.shape[0] == 0:
-                continue
+            p_a, p_b = got
 
             total_pair_matches += int(p_a.shape[0])
             if p_a.shape[0] > max_points_per_overlap_frame:
@@ -915,15 +1228,21 @@ def optimize_submap_scales_gtsam(
                         f"Missing cached match result for covisible frame pair ({frame_key_a}, {frame_key_b})."
                     )
 
-                matched_points_a = np.asarray(match_result["matched_points0"], dtype=np.float32)
-                matched_points_b = np.asarray(match_result["matched_points1"], dtype=np.float32)
-                p_a, p_b = _extract_local_points_from_matched_pixels(
-                    frame_ids_a=np.asarray(getattr(submap_a, "frame_point_ids")[frame_key_a], dtype=np.int64),
-                    frame_ids_b=np.asarray(getattr(submap_b, "frame_point_ids")[frame_key_b], dtype=np.int64),
-                    matched_points_a=matched_points_a,
-                    matched_points_b=matched_points_b,
-                    local_points_a=local_points_a,
-                    local_points_b=local_points_b,
+                mp_obj_a, mp_obj_b = match_result["matched_points0"], match_result["matched_points1"]
+                fid_obj_a = getattr(submap_a, "frame_point_ids")[frame_key_a]
+                fid_obj_b = getattr(submap_b, "frame_point_ids")[frame_key_b]
+                p_a, p_b = _pair_cache_get(
+                    ("covisibility", key_a, key_b, frame_key_a, frame_key_b),
+                    (local_points_a, local_points_b, fid_obj_a, fid_obj_b, mp_obj_a, mp_obj_b),
+                    lambda fid_obj_a=fid_obj_a, fid_obj_b=fid_obj_b, mp_obj_a=mp_obj_a, mp_obj_b=mp_obj_b,
+                           local_points_a=local_points_a, local_points_b=local_points_b: _extract_local_points_from_matched_pixels(
+                        frame_ids_a=np.asarray(fid_obj_a, dtype=np.int64),
+                        frame_ids_b=np.asarray(fid_obj_b, dtype=np.int64),
+                        matched_points_a=np.asarray(mp_obj_a, dtype=np.float32),
+                        matched_points_b=np.asarray(mp_obj_b, dtype=np.float32),
+                        local_points_a=local_points_a,
+                        local_points_b=local_points_b,
+                    ),
                 )
                 if p_a.shape[0] == 0:
                     continue
